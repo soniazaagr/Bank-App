@@ -1,0 +1,22 @@
+node_modules/
+dist/
+build/
+.env
+.env.*
+!.env.example
+*.log
+coverage/
+.vscode/
+.idea/
+
+# Generated files
+node_modules/
+*.js.map
+*.d.ts
+# Backend compiled JavaScript
+backend/src/**/*.js
+
+
+frontend/node_modules.incomplete-*/
+
+*.d.ts.map
