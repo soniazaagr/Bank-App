@@ -1,4 +1,4 @@
-const API_BASE_URL = 'http://localhost:5000'
+const API_BASE_URL = 'https://bank-app-yeq4.onrender.com'
 const ACCESS_TOKEN_KEY = 'bank_access_token'
 
 type ApiError = Error & { status?: number }
