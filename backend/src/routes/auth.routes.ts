@@ -1,15 +1,55 @@
-import { Router } from 'express'
+import { Router, type Response } from 'express'
 import bcrypt from 'bcrypt'
 import { randomUUID } from 'crypto'
 import { pool } from '../config/database.js'
 import { createVerificationCode } from '../services/verification.service.js'
 import { consumeRateLimit, requestIdentifier } from '../services/rate-limit.service.js'
 import type { PoolClient } from 'pg'
-import { sendVerificationEmail } from '../services/email.service.js'
+import { queueVerificationEmail } from '../services/email.service.js'
 import { createAuthenticatedSession } from '../services/session.service.js'
 import { setRefreshTokenCookie } from '../services/refresh-cookie.service.js'
 
 const router = Router()
+
+type ExistingUser = {
+  id: string
+  email: string
+  phone: string
+  email_verified: boolean
+  password_hash: string
+  status: string
+  email_matches: boolean
+}
+
+async function findExistingUser(email: string, phone: string) {
+  return pool.query<ExistingUser>(
+    `
+    SELECT id, email, phone, password_hash, email_verified, status, email = $1 AS email_matches
+    FROM users
+    WHERE email = $1 OR phone = $2
+    LIMIT 1
+    `,
+    [email, phone],
+  )
+}
+
+async function existingRegistrationResponse(res: Response, user: ExistingUser, password: unknown) {
+  if (
+    user.email_matches &&
+    !user.email_verified &&
+    user.status === 'PENDING' &&
+    typeof password === 'string' &&
+    await bcrypt.compare(password, user.password_hash)
+  ) {
+    return res.status(409).json({
+      success: false,
+      code: 'EMAIL_VERIFICATION_REQUIRED',
+      message: 'An account with this email already exists and needs email verification.',
+      verificationUser: { id: user.id, email: user.email, phone: user.phone, status: user.status },
+    })
+  }
+  return res.status(409).json({ success: false, message: 'Email or phone already registered' })
+}
 
 router.post('/register', async (req, res) => {
   try {
@@ -32,21 +72,10 @@ router.post('/register', async (req, res) => {
       })
     }
 
-    const existingUser = await pool.query(
-      `
-      SELECT id
-      FROM users
-      WHERE email = $1 OR phone = $2
-      LIMIT 1
-      `,
-      [email, phone],
-    )
+    const existingUser = await findExistingUser(email, phone)
 
     if (existingUser.rows.length > 0) {
-      return res.status(409).json({
-        success: false,
-        message: 'Email or phone already registered',
-      })
+      return await existingRegistrationResponse(res, existingUser.rows[0]!, password)
     }
 
     const passwordHash = await bcrypt.hash(password, 12)
@@ -87,15 +116,9 @@ router.post('/register', async (req, res) => {
         `,
         [walletId, userId],
       )
-
+      const emailVerification = await createVerificationCode(userId, 'EMAIL', client)
       await client.query('COMMIT')
-
-      const emailVerification = await createVerificationCode(
-        userId,
-        'EMAIL',
-      )
-
-      await sendVerificationEmail(email, emailVerification.code)
+      queueVerificationEmail(email, emailVerification.code)
 
       return res.status(201).json({
         success: true,
@@ -120,8 +143,36 @@ router.post('/register', async (req, res) => {
     } finally {
       client.release()
     }
-  } catch {
-    console.error('Registration operation failed')
+  } catch (error) {
+    if (error && typeof error === 'object' && 'code' in error && error.code === '23505') {
+      const { email, phone, password } = req.body
+      if (email && phone) {
+        const existingUser = await findExistingUser(email, phone)
+        if (existingUser.rows.length > 0) return await existingRegistrationResponse(res, existingUser.rows[0]!, password)
+      }
+    }
+    const diagnostic = error && typeof error === 'object'
+      ? error as {
+        name?: unknown
+        message?: unknown
+        code?: unknown
+        stack?: unknown
+        constraint?: unknown
+        detail?: unknown
+        table?: unknown
+        column?: unknown
+      }
+      : undefined
+    console.error('REGISTRATION ERROR', {
+      name: typeof diagnostic?.name === 'string' ? diagnostic.name : 'UnknownError',
+      message: typeof diagnostic?.message === 'string' ? diagnostic.message : 'Unknown error',
+      code: typeof diagnostic?.code === 'string' ? diagnostic.code : undefined,
+      stack: typeof diagnostic?.stack === 'string' ? diagnostic.stack : undefined,
+      constraint: typeof diagnostic?.constraint === 'string' ? diagnostic.constraint : undefined,
+      detail: typeof diagnostic?.detail === 'string' ? '[redacted: may contain user data]' : undefined,
+      table: typeof diagnostic?.table === 'string' ? diagnostic.table : undefined,
+      column: typeof diagnostic?.column === 'string' ? diagnostic.column : undefined,
+    })
 
     return res.status(500).json({
       success: false,
@@ -297,6 +348,7 @@ router.post('/resend-otp', async (req, res) => {
   }
 
   try {
+    let emailDelivery: { recipient: string, code: string } | undefined
     const ipLimit = await consumeRateLimit(
       'otp_resend_ip',
       req.ip ?? 'unknown',
@@ -336,7 +388,7 @@ router.post('/resend-otp', async (req, res) => {
             [userId, channel],
           )
           const newVerification = await createVerificationCode(userId, channel, client)
-          await sendVerificationEmail(user.rows[0].email, newVerification.code)
+          emailDelivery = { recipient: user.rows[0].email, code: newVerification.code }
         }
       }
       await client.query('COMMIT')
@@ -346,6 +398,7 @@ router.post('/resend-otp', async (req, res) => {
     } finally {
       client.release()
     }
+    if (emailDelivery) queueVerificationEmail(emailDelivery.recipient, emailDelivery.code)
     return res.json(safeResponse)
   } catch {
     console.error('OTP resend operation failed')
