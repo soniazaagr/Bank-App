@@ -41,6 +41,16 @@ export async function sendVerificationEmail(
   })
 }
 
+// SMTP delivery may wait for connection/retry timeouts. Account and OTP state are
+// already committed before this is scheduled, so it must not hold up the API response.
+export function queueVerificationEmail(recipient: string, code: string) {
+  setImmediate(() => {
+    void sendVerificationEmail(recipient, code).catch(() => {
+      console.error('Verification email delivery failed')
+    })
+  })
+}
+
 export async function sendLoginVerificationEmail(
   recipient: string,
   code: string,
